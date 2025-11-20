@@ -1,6 +1,9 @@
 """Solution."""
 import numpy as np
 from scipy.optimize import fmin_l_bfgs_b
+from scipy.stats import norm
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import ConstantKernel, Matern, DotProduct
 # import additional ...
 
 
@@ -8,6 +11,15 @@ from scipy.optimize import fmin_l_bfgs_b
 DOMAIN = np.array([[0, 10]])  # restrict \theta in [0, 10]
 SAFETY_THRESHOLD = 4  # threshold, upper bound of SA
 
+def get_initial_safe_point(domain=DOMAIN):
+    """Return initial safe point"""
+    x_domain = np.linspace(*domain[0], 4000)[:, None]
+    # assume v(x) = 2 for initial safe points
+    c_val = np.full_like(x_domain, 2.0)
+    x_valid = x_domain[c_val < SAFETY_THRESHOLD]
+    np.random.seed(0)
+    np.random.shuffle(x_valid)
+    return x_valid[0].reshape(1, -1)
 
 # TODO: implement a self-contained solution in the BO_algo class.
 # NOTE: main() is not called by the checker.
@@ -15,7 +27,71 @@ class BO_algo():
     def __init__(self):
         """Initializes the algorithm with a parameter configuration."""
         # TODO: Define all relevant class members for your BO algorithm here.
-        pass
+        # data storage
+        self.X = np.zeros((0, DOMAIN.shape[0]))
+        self.y_f = np.zeros((0,))
+        self.y_v = np.zeros((0,))
+
+        # constants
+        self.prior_mean_v = 4.0
+        self.kappa = SAFETY_THRESHOLD
+        self.domain = DOMAIN
+
+        # noise levels
+        self.sigma_f = 0.15
+        self.sigma_v = 1e-4
+        self.alpha_f = self.sigma_f ** 2
+        self.alpha_v = self.sigma_v ** 2
+
+        # GPs and kernels
+        self.gp_f = None
+        self.gp_v = None
+        self.kern_f = ConstantKernel(0.5, (1e-3, 1e3)) * Matern(length_scale=1.0,
+                                                                length_scale_bounds=(1e-2, 1e2),
+                                                                nu=2.5)
+        self.kern_v = DotProduct(sigma_0=1.0) + Matern(length_scale=1.0,
+                                                       length_scale_bounds=(1e-2, 1e2),
+                                                       nu=2.5)
+
+        # GP fitting options
+        self.n_restarts_optimizer = 5
+        self.normalize_y = True
+
+        # acquisition/safety hyperparams
+        self.xi = 0.01  # for EI
+        self.beta_v = 3.0  # UCB multiplier for conservative safety
+        self.N_unsafe_max = 3
+        self.N_unsafe_used = 0
+
+    def _fit_gps(self):
+        if self.X.shape[0] == 0:
+            return
+
+        # Fit objective GP
+        self.gp_f = GaussianProcessRegressor(
+            kernel=self.kern_f,
+            alpha=self.alpha_f,
+            normalize_y=self.normalize_y,
+            n_restarts_optimizer=self.n_restarts_optimizer
+        )
+        self.gp_f.fit(self.X, self.y_f)
+
+        # Fit constraint GP
+        self.gp_v = GaussianProcessRegressor(
+            kernel=self.kern_v,
+            alpha=self.alpha_v,
+            normalize_y=False,
+            n_restarts_optimizer=self.n_restarts_optimizer
+        )
+        self.gp_v.fit(self.X, self.y_v)
+
+    def _find_safest_point(self):
+        """Return the safest point according to constraint GP"""
+        grid = np.linspace(self.domain[0,0], self.domain[0,1], 400).reshape(-1,1)
+        mu_v, sigma_v = self.gp_v.predict(grid, return_std=True)
+        mu_v = mu_v + self.prior_mean_v
+        best_idx = np.argmin(mu_v)
+        return grid[best_idx].reshape(1, -1)
 
     def next_recommendation(self):
         """
@@ -31,8 +107,22 @@ class BO_algo():
         # In implementing this function, you may use
         # optimize_acquisition_function() defined below.
 
-        raise NotImplementedError
+        if self.X.shape[0] == 0:
+            return get_initial_safe_point()
 
+        self._fit_gps()
+        x_opt = self.optimize_acquisition_function()
+        x_opt = np.atleast_2d(x_opt).reshape(1, -1)
+
+        mu_v, sigma_v = self.gp_v.predict(x_opt, return_std=True)
+        mu_v = mu_v + self.prior_mean_v
+        ucb_v = mu_v + self.beta_v * sigma_v
+
+        if ucb_v > self.kappa:
+            return self._find_safest_point()
+
+        return x_opt
+    
     def optimize_acquisition_function(self):
         """Optimizes the acquisition function defined below (DO NOT MODIFY).
 
@@ -44,24 +134,19 @@ class BO_algo():
         """
 
         def objective(x):
-            return -self.acquisition_function(x)
+            return -self.acquisition_function(x).item()
 
         f_values = []
         x_values = []
 
-        # Restarts the optimization 20 times and pick the best solution
         for _ in range(20):
-            x0 = DOMAIN[:, 0] + (DOMAIN[:, 1] - DOMAIN[:, 0]) * \
-                 np.random.rand(DOMAIN.shape[0])
-            result = fmin_l_bfgs_b(objective, x0=x0, bounds=DOMAIN,
-                                   approx_grad=True)
-            x_values.append(np.clip(result[0], *DOMAIN[0]))
-            f_values.append(-result[1])
+            x0 = DOMAIN[:,0] + (DOMAIN[:,1]-DOMAIN[:,0])*np.random.rand(DOMAIN.shape[0])
+            res = fmin_l_bfgs_b(objective, x0=x0, bounds=DOMAIN, approx_grad=True)
+            x_values.append(np.clip(res[0], *DOMAIN[0]))
+            f_values.append(-res[1])
 
-        ind = np.argmax(f_values)
-        x_opt = x_values[ind].item()
-
-        return x_opt
+        best_idx = np.argmax(f_values)
+        return np.array([[x_values[best_idx]]])
 
     def acquisition_function(self, x: np.ndarray):
         """Compute the acquisition function for x.
@@ -78,8 +163,21 @@ class BO_algo():
             Value of the acquisition function at x
         """
         x = np.atleast_2d(x)
-        # TODO: Implement the acquisition function you want to optimize.
-        raise NotImplementedError
+
+        mu_f, sigma_f = self.gp_f.predict(x, return_std=True)
+        sigma_f = np.maximum(sigma_f.reshape(-1,1), 1e-9)
+
+        f_best = np.max(self.y_f)
+        Z = (mu_f - f_best - self.xi)/sigma_f
+        ei = (mu_f - f_best - self.xi) * norm.cdf(Z) + sigma_f * norm.pdf(Z)
+
+        mu_v, sigma_v = self.gp_v.predict(x, return_std=True)
+        mu_v = mu_v.reshape(-1,1) + self.prior_mean_v
+        sigma_v = np.maximum(sigma_v.reshape(-1,1), 1e-9)
+        Z_safe = (self.kappa - mu_v)/sigma_v
+        p_safe = norm.cdf(Z_safe)
+
+        return (ei * p_safe).reshape(-1,1)
 
     def add_data_point(self, x: float, f: float, v: float):
         """
@@ -95,7 +193,15 @@ class BO_algo():
             SA constraint func
         """
         # TODO: Add the observed data {x, f, v} to your model.
-        raise NotImplementedError
+        # Ensure x is 2D with shape (1, D)
+        x = np.atleast_2d(x).reshape(1, -1)
+
+        self.X = np.vstack([self.X, x])
+        self.y_f = np.append(self.y_f, f)
+        self.y_v = np.append(self.y_v, v - self.prior_mean_v)
+        if v > self.kappa:
+            self.N_unsafe_used += 1
+
 
     def get_solution(self):
         """
@@ -107,7 +213,27 @@ class BO_algo():
             the optimal solution of the problem
         """
         # TODO: Return your predicted safe optimum of f.
-        raise NotImplementedError
+        if self.X.shape[0] == 0:
+            return np.array([[self.domain[0,0]]])
+
+        self._fit_gps()
+        grid = np.linspace(self.domain[0,0], self.domain[0,1], 400).reshape(-1,1)
+        mu_f, _ = self.gp_f.predict(grid, return_std=True)
+        mu_v, _ = self.gp_v.predict(grid, return_std=True)
+        mu_v = mu_v.reshape(-1,1) + self.prior_mean_v
+
+        safe_mask = (mu_v < self.kappa).flatten()
+        if np.sum(safe_mask) == 0:
+            safe_obs_mask = (self.y_v + self.prior_mean_v < self.kappa)
+            if np.sum(safe_obs_mask) > 0:
+                best_idx = np.argmax(self.y_f[safe_obs_mask])
+                return self.X[safe_obs_mask][best_idx].reshape(1,-1)
+            return np.array([[self.domain[0,0]]])
+
+        safe_grid = grid[safe_mask]
+        safe_mu_f = mu_f[safe_mask]
+        best_idx = np.argmax(safe_mu_f)
+        return safe_grid[best_idx].reshape(1,-1)
 
     def plot(self, plot_recommendation: bool = True):
         """Plot objective and constraint posterior for debugging (OPTIONAL).
