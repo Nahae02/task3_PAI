@@ -67,7 +67,7 @@ class BO_algo():
         if self.X.shape[0] == 0:
             return
 
-        # Fit objective GP
+        # fit objective GP
         self.gp_f = GaussianProcessRegressor(
             kernel=self.kern_f,
             alpha=self.alpha_f,
@@ -76,7 +76,7 @@ class BO_algo():
         )
         self.gp_f.fit(self.X, self.y_f)
 
-        # Fit constraint GP
+        # fit constraint GP
         self.gp_v = GaussianProcessRegressor(
             kernel=self.kern_v,
             alpha=self.alpha_v,
@@ -193,7 +193,7 @@ class BO_algo():
             SA constraint func
         """
         # TODO: Add the observed data {x, f, v} to your model.
-        # Ensure x is 2D with shape (1, D)
+        # ensure x is 2D with shape (1, D)
         x = np.atleast_2d(x).reshape(1, -1)
 
         self.X = np.vstack([self.X, x])
